@@ -11,7 +11,7 @@
 # 客户端主动连接并保持心跳，所以客户端在 NAT 后面（没有公网 IP）也能用。
 set -euo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 WG_DIR=/etc/wireguard
 MARK="# managed-by: wg.sh"
 KEEPALIVE=25
@@ -96,16 +96,68 @@ pick_iface() {   # pick_iface server|client|any -> $IFACE
     esac
 }
 
-local_addrs() { ip -o -4 addr show | awk '{print $4}'; }
+# ---------------------------------------------------------------- 校验
+O4='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'   # 0-255，不允许前导 0
+valid_ipv4()   { [[ "$1" =~ ^$O4\.$O4\.$O4\.$O4$ ]]; }
+valid_port()   { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]; }
+valid_domain() { [ ${#1} -le 253 ] && [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]{0,62}$ ]]; }
+valid_host()   { valid_ipv4 "$1" || valid_domain "$1" || [[ "$1" =~ ^\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\]$ ]]; }   # IPv6 要带 []
 
-net_in_use() {   # net_in_use 10.66.66 -> 本机已有这个 /24 里的地址或路由
-    local p="$1"
-    local_addrs | grep -q "^$p\." && return 0
-    ip -4 route show | awk '{print $1}' | grep -q "^$p\." && return 0
-    return 1
+is_private_ip() {   # 10/8 172.16/12 192.168/16
+    valid_ipv4 "$1" || return 1
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+    [ "$a" = 10 ] || { [ "$a" = 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; } || { [ "$a" = 192 ] && [ "$b" = 168 ]; }
+}
+not_public_ip() {   # 私有 / CGNAT 100.64/10 / 回环 / 链路本地
+    is_private_ip "$1" && return 0
+    valid_ipv4 "$1" || return 1
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+    [ "$a" = 127 ] || [ "$a" = 0 ] || { [ "$a" = 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; } || { [ "$a" = 169 ] && [ "$b" = 254 ]; }
 }
 
-port_in_use() { [ -n "$(ss -Hlun "sport = :$1" 2>/dev/null)" ]; }
+# parse_net24 "10.66.66.0/24" -> NET24=10.66.66；也接受 10.66.66.0、10.66.66。不合法时打印原因
+parse_net24() {
+    local s="$1" len=24
+    [[ "$s" == */* ]] && { len="${s##*/}"; s="${s%/*}"; }
+    [[ "$s" =~ ^$O4\.$O4\.$O4(\.$O4)?$ ]] || { echo "格式不对：请输入形如 10.66.66.0/24 的网段（每段 0-255）"; return 1; }
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[5]}"
+    [ "$len" = 24 ] || { echo "只支持 /24 网段"; return 1; }
+    [ -z "$d" ] || [ "$d" = 0 ] || { echo "网段最后一位应为 0：$a.$b.$c.0/24"; return 1; }
+    is_private_ip "$a.$b.$c.0" || { echo "$a.$b.$c.0/24 不是私有网段，只能用 10.x.x.0、172.16~31.x.0、192.168.x.0"; return 1; }
+    NET24="$a.$b.$c"
+}
+
+ip2int() { local IFS=. o; read -r -a o <<< "$1"; echo $(( (10#${o[0]} << 24) | (10#${o[1]} << 16) | (10#${o[2]} << 8) | 10#${o[3]} )); }
+same_net() { (( ($1 >> (32 - $3)) == ($2 >> (32 - $3)) )); }   # same_net 整数a 整数b 前缀长度
+
+# net_check 10.66.66.0/24 -> 返回 0=可用；1=冲突；2=落在一条更大的路由里（例如云厂商内网 10.0.0.0/8）
+# 返回非 0 时打印冲突项。冲突 = 本机地址和它重叠，或者有路由落在它里面（docker 网桥、其它 VPN 等）。
+# 更大的路由：新网段更具体，路由上能用，但会挡住那条大路由里这一段地址。/0~/7（默认路由、VPN 的 0.0.0.0/1）不算。
+net_check() {
+    local net len a alen soft=""
+    net=$(ip2int "${1%/*}"); len="${1#*/}"
+    while read -r a; do
+        alen=32; [[ "$a" == */* ]] && { alen="${a#*/}"; a="${a%/*}"; }
+        valid_ipv4 "$a" || continue
+        same_net "$(ip2int "$a")" "$net" $(( alen < len ? alen : len )) && { echo "本机地址 $a/$alen"; return 1; }
+    done < <(ip -o -4 addr show | awk '{print $4}')
+    while read -r a; do
+        alen=32; [[ "$a" == */* ]] && { alen="${a#*/}"; a="${a%/*}"; }
+        valid_ipv4 "$a" && [ "$alen" -ge 8 ] || continue
+        same_net "$(ip2int "$a")" "$net" $(( alen < len ? alen : len )) || continue
+        [ "$alen" -ge "$len" ] && { echo "路由 $a/$alen"; return 1; }
+        [ -n "$soft" ] || soft="路由 $a/$alen"
+    done < <(ip -4 route show table all |
+             awk '{ print ($1 ~ /^(unicast|local|broadcast|multicast|anycast|unreachable|blackhole|prohibit|throw|nat)$/) ? $2 : $1 }')
+    [ -z "$soft" ] && return 0
+    echo "$soft"; return 2
+}
+
+# UDP 端口被监听，或者被 /etc/wireguard 里其它配置（可能没启动）占用
+port_in_use() {
+    [ -n "$(ss -Hlun "sport = :$1" 2>/dev/null)" ] && return 0
+    grep -qsE "^ListenPort *= *$1 *$" "$WG_DIR"/*.conf
+}
 
 detect_public_ip() {
     local ip="" u
@@ -190,34 +242,47 @@ install_server() {
         break
     done
 
-    local p cand=""
-    for p in 10.66.66 10.77.77 10.88.88 10.99.99 172.29.29 192.168.233; do net_in_use "$p" || { cand="$p"; break; }; done
+    local p cand="" why rc
+    for p in 10.66.66 10.77.77 10.88.88 10.99.99 172.29.29 192.168.233; do
+        net_check "$p.0/24" >/dev/null && { cand="$p"; break; }
+    done
     while :; do
         ask "隧道网段（/24）" "${cand:-10.66.66}.0/24"
-        p="${REPLY%.0/24}"; p="${p%/24}"
-        [[ "$p" =~ ^(10|172|192)\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || { echo "请输入形如 10.66.66.0/24 的私有网段"; continue; }
-        net_in_use "$p" && { echo "$p.0/24 和本机已有的地址或路由冲突，换一个"; continue; }
+        parse_net24 "$REPLY" || continue
+        p="$NET24"
+        rc=0; why=$(net_check "$p.0/24") || rc=$?
+        case $rc in
+            1) echo "$p.0/24 和$why 冲突，换一个"; continue ;;
+            2) warn "$p.0/24 落在本机的$why 里面（可能是云厂商内网），那条路由里的 $p.x 地址将无法访问"
+               confirm "仍然使用 $p.0/24？" n || continue ;;
+        esac
         NET="$p"; break
     done
 
     local port=51820
-    while port_in_use "$port"; do port=$((port + 1)); done
+    while port_in_use "$port" && [ "$port" -lt 65535 ]; do port=$((port + 1)); done
     while :; do
         ask "监听 UDP 端口" "$port"
-        [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le 65535 ] || { echo "端口无效"; continue; }
-        port_in_use "$REPLY" && { echo "UDP $REPLY 已被占用"; continue; }
+        valid_port "$REPLY" || { echo "端口无效：请输入 1-65535 的数字"; continue; }
+        port_in_use "$REPLY" && { echo "UDP $REPLY 已被占用（其它程序或 $WG_DIR 里的其它配置），换一个"; continue; }
         PORT="$REPLY"; break
     done
 
     info "检测公网 IP…"
-    local pub; pub=$(detect_public_ip)
+    local pub host; pub=$(detect_public_ip)
     while :; do
         if [ -n "$pub" ]; then ask "客户端用来连接本机的公网 IP 或域名" "$pub"
         else ask "客户端用来连接本机的公网 IP 或域名（没检测到，请手动填写）" ""; fi
-        [ -n "$REPLY" ] && break
+        [ -n "$REPLY" ] || continue
+        host="$REPLY"
+        [[ "$host" == *:* && "$host" != \[* ]] && host="[$host]"   # IPv6
+        valid_host "$host" || { echo "格式不对：只填 IP 或域名，不要带端口、http:// 或路径"; continue; }
+        if not_public_ip "$host"; then
+            warn "$host 不是公网地址，只有能直接访问它的客户端才连得上"
+            confirm "仍然使用 $host？" n || continue
+        fi
+        break
     done
-    local host="$REPLY"
-    [[ "$host" == *:* && "$host" != \[* ]] && host="[$host]"   # IPv6
 
     umask 077
     mkdir -p "$WG_DIR"
@@ -276,7 +341,8 @@ add_client() {
         unset C_v C_pubkey C_ip C_name
         decode WGR1: "$reply" || { echo "回复码不对：请复制客户端上以 WGR1: 开头的整行"; continue; }
         valid_key "${C_pubkey:-}" || { echo "回复码里的公钥无效"; continue; }
-        [ "${C_ip:-}" = "$ip" ] || [[ "${C_ip:-}" =~ ^${net//./\\.}\.([0-9]+)$ ]] || { echo "回复码里的地址 ${C_ip:-?} 不在 $net.0/24 里"; continue; }
+        valid_ipv4 "${C_ip:-}" && [ "${C_ip%.*}" = "$net" ] && [ "${C_ip##*.}" -ge 2 ] && [ "${C_ip##*.}" -le 254 ] \
+            || { echo "回复码里的地址 ${C_ip:-?} 不是 $net.2 ~ $net.254 里的地址"; continue; }
         if grep -q "^PublicKey *= *${C_pubkey}$" "$WG_DIR/$IFACE.conf"; then echo "这个客户端已经添加过了"; return 0; fi
         if grep -q "^AllowedIPs *= *${C_ip}/32" "$WG_DIR/$IFACE.conf" || [ "$C_ip" = "$net.1" ]; then
             echo "地址 $C_ip 已被占用：回到上面重新生成邀请码"; return 1
@@ -327,6 +393,17 @@ remove_client() {
 }
 
 # ---------------------------------------------------------------- 客户端
+check_invite() {   # 校验 decode 出来的邀请码字段，不合法时打印原因
+    valid_key "${C_pubkey:-}" || { echo "邀请码里的服务端公钥无效"; return 1; }
+    local ep="${C_endpoint:-}"
+    [[ "$ep" == *:* ]] && valid_port "${ep##*:}" && valid_host "${ep%:*}" \
+        || { echo "邀请码里的服务端地址「$ep」无效（应为 IP或域名:端口）"; return 1; }
+    local s="${C_server_ip:-}" c="${C_client_ip:-}"
+    is_private_ip "$s" && is_private_ip "$c" || { echo "邀请码里的隧道地址无效（$s / $c）"; return 1; }
+    [ "${s%.*}" = "${c%.*}" ] && [ "$s" != "$c" ] || { echo "邀请码里的两个隧道地址不在同一个 /24 网段（$s / $c）"; return 1; }
+    [ "${c##*.}" -ge 2 ] && [ "${c##*.}" -le 254 ] || { echo "邀请码里分配的隧道地址 $c 不可用（应为 .2 ~ .254）"; return 1; }
+}
+
 install_client() {
     install_wg
     hr; echo "${B}安装客户端${N}（本机有没有公网 IP 都可以）"
@@ -336,17 +413,21 @@ install_client() {
         ask "粘贴邀请码" ""
         unset C_v C_endpoint C_pubkey C_server_ip C_client_ip
         decode WGI1: "$REPLY" || { echo "邀请码不对：请复制服务端显示的以 WGI1: 开头的整行"; continue; }
-        valid_key "${C_pubkey:-}" && [ -n "${C_endpoint:-}" ] && [ -n "${C_server_ip:-}" ] && [ -n "${C_client_ip:-}" ] \
-            || { echo "邀请码内容不完整"; continue; }
-        break
+        check_invite && break
     done
     echo "  服务端：$C_endpoint（隧道地址 $C_server_ip）  本机将使用隧道地址：$C_client_ip"
 
     local existing; existing=$(grep -l "^PublicKey *= *${C_pubkey}$" "$WG_DIR"/*.conf 2>/dev/null | head -1 || true)
     [ -z "$existing" ] || die "本机已经连着这个服务端了（$existing）。要重装先「卸载」它"
-    local_addrs | grep -q "^${C_client_ip}/" && die "本机已经有地址 $C_client_ip：服务端换个网段重新安装"
-    local route; route=$(ip -4 route show to match "$C_server_ip" | grep -v '^default' || true)
-    [ -z "$route" ] || die "到 $C_server_ip 已经有路由（$route），会冲突：服务端换个网段重新安装"
+    local a why rc
+    for a in "$C_client_ip" "$C_server_ip"; do
+        rc=0; why=$(net_check "$a/32") || rc=$?
+        case $rc in
+            1) die "隧道地址 $a 和本机$why 冲突：服务端换个网段重新安装" ;;
+            2) warn "隧道地址 $a 落在本机的$why 里面，安装后发往 $a 的流量改走隧道"
+               confirm "继续？" y || exit 0 ;;
+        esac
+    done
 
     local def; def=$(free_iface)
     while :; do
